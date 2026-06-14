@@ -121,3 +121,12 @@ cli codex-pp 你的问题  # 用 codex-pp 回(默认)
 ## 许可证
 
 MIT
+
+
+## 💬 联系
+
+扫码加微信群（AI 工具使用 / 提 issue / 需求讨论）：
+
+![微信群](assets/wechat-qr.png)
+
+或提 [GitHub Issue](https://github.com/fast118/feishu-bot/issues)
