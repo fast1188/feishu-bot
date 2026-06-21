@@ -1,22 +1,26 @@
 """
-feishu_bot.py - 飞书机器人最小 demo
-===================================
+feishu_bot.py - Hermes/OpenClaw 飞书网关 v0.2 (WebSocket 长连接模式)
+=========================================================================
 
-功能:
-- 飞书机器人接收消息
-- 调用 openclaw / hermes CLI
-- 把结果发回飞书
+v0.2 新增:
+- 消息持久化: ~/.feishu_bot/history/<chat_id>.jsonl (每条消息一行)
+- 多 bot 路由: 每个 chat 记住默认 bot (hermes / openclaw / codex-pp)
+- 命令: /history, /bot <name>, /reset
 
 用法:
-1. 飞书开放平台: https://open.feishu.cn/app
-2. 创建企业自建应用,记下 App ID 和 App Secret
-3. 启用"机器人"能力
-4. 添加"消息接收"webhook 或用 websocket
-5. 填入 .env
-6. 跑: py feishu_bot.py
+1. 飞书后台 → 事件订阅 → 选"长连接接收"
+2. .env 填 FEISHU_APP_ID / FEISHU_APP_SECRET
+3. 跑: python feishu_bot.py
+4. 命令:
+   - help / 帮助 - 列出命令
+   - ping - 测试
+   - /bot openclaw - 切到 openclaw (本 chat 持久化)
+   - /bot - 查当前 bot
+   - /history [N] - 看最近 N 条历史 (默认 10)
+   - /reset - 清本 chat 历史
+   - 任何问题 - 调当前 bot 回答
 
-需要的依赖:
-- pip install lark-oapi websockets
+依赖: pip install lark-oapi
 """
 
 import os
@@ -25,254 +29,398 @@ import json
 import subprocess
 import shlex
 import logging
+import tempfile
+from datetime import datetime
 from pathlib import Path
+
+# fcntl 是 Unix only, Windows 用不到
+try:
+    import fcntl as _fcntl
+    HAS_FCNTL = True
+except ImportError:
+    HAS_FCNTL = False
+
+# ==== Windows GBK stdout 兜底 ====
+for _s in (sys.stdout, sys.stderr):
+    try:
+        _s.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
+# ==== 自动加载 .env ====
+_ENV_PATH = Path(__file__).resolve().parent / ".env"
+if _ENV_PATH.exists():
+    for _line in _ENV_PATH.read_text(encoding="utf-8", errors="ignore").splitlines():
+        _line = _line.strip()
+        if not _line or _line.startswith("#") or "=" not in _line:
+            continue
+        _k, _v = _line.split("=", 1)
+        _k, _v = _k.strip(), _v.strip().strip('"').strip("'")
+        if _k and _k not in os.environ:
+            os.environ[_k] = _v
+
+try:
+    import lark_oapi as lark
+    from lark_oapi.api.im.v1.model.p2_im_message_receive_v1 import (
+        P2ImMessageReceiveV1,
+        P2ImMessageReceiveV1Data,
+    )
+    HAS_LARK = True
+except ImportError:
+    HAS_LARK = False
+    lark = None
+    P2ImMessageReceiveV1 = None
+    P2ImMessageReceiveV1Data = None
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
 )
-logger = logging.getLogger("feishu-bot")
+logger = logging.getLogger("hermes-feishu")
+
+APP_ID = os.getenv("FEISHU_APP_ID", "")
+APP_SECRET = os.getenv("FEISHU_APP_SECRET", "")
+DEFAULT_CLI = os.getenv("FEISHU_CLI", "hermes")
+SUPPORTED_BOTS = ("hermes", "openclaw", "codex-pp")
+
+# ==== 持久化路径 ====
+HISTORY_DIR = Path.home() / ".feishu_bot" / "history"
+ROUTING_FILE = Path.home() / ".feishu_bot" / "routing.json"
+HISTORY_DIR.mkdir(parents=True, exist_ok=True)
+
+# 文件锁 (Unix 优先, Windows 退化)
+try:
+    import fcntl as _fcntl
+    HAS_FCNTL = True
+except ImportError:
+    HAS_FCNTL = False
 
 
-# ============== 配置 ==============
-
-# 飞书凭证(从飞书后台拿)
-APP_ID = os.getenv("FEISHU_APP_ID", "cli_xxxxxxxxxxxx")
-APP_SECRET = os.getenv("FEISHU_APP_SECRET", "your_app_secret_here")
-
-# 验证 token(可选,验证 webhook 回调用)
-VERIFICATION_TOKEN = os.getenv("FEISHU_VERIFICATION_TOKEN", "")
-ENCRYPT_KEY = os.getenv("FEISHU_ENCRYPT_KEY", "")
-
-# 监听端口(webhook 模式)
-LISTEN_PORT = int(os.getenv("FEISHU_PORT", "9999"))
-
-# 默认用哪个 CLI:openclaw / hermes / codex-pp
-DEFAULT_CLI = os.getenv("FEISHU_CLI", "codex-pp")
-
-
-# ============== CLI 调用 ==============
-
-def call_cli(prompt: str, cli: str = None) -> str:
-    """调用本地 CLI 工具"""
-    cli = cli or DEFAULT_CLI
+def with_lock(fn):
+    if not HAS_FCNTL:
+        return fn()
+    lock_path = HISTORY_DIR / ".lock"
+    lock_fd = open(lock_path, "w")
     try:
-        if cli == "openclaw":
-            cmd = ["openclaw", "ask", prompt]
-        elif cli == "hermes":
-            cmd = ["hermes", "chat", "--message", prompt]
-        elif cli == "codex-pp":
-            cmd = ["codex-pp", "ask", prompt]
-        else:
-            return f"[错误] 未知 CLI: {cli}"
-        logger.info(f"执行命令: {' '.join(shlex.quote(c) for c in cmd)}")
+        _fcntl.flock(lock_fd.fileno(), _fcntl.LOCK_EX)
+        return fn()
+    finally:
+        try:
+            _fcntl.flock(lock_fd.fileno(), _fcntl.LOCK_UN)
+        except OSError:
+            pass
+        lock_fd.close()
+
+
+# ==== 消息持久化 ====
+
+def history_file(chat_id: str) -> Path:
+    """每个 chat 一个 jsonl 文件"""
+    safe = "".join(c if c.isalnum() else "_" for c in chat_id)[:64]
+    return HISTORY_DIR / f"{safe}.jsonl"
+
+
+def save_message(chat_id: str, record: dict) -> None:
+    """追加一条消息到 history (原子写)"""
+    f = history_file(chat_id)
+    record.setdefault("ts", datetime.now().isoformat(timespec="seconds"))
+    line = json.dumps(record, ensure_ascii=False) + "\n"
+    # 简单文件锁 + 追加
+    with_lock(lambda: None)
+    fd, tmp = tempfile.mkstemp(dir=HISTORY_DIR, prefix=".msg_", suffix=".tmp")
+    try:
+        # 读旧 + 追加 + 写 tmp
+        old = f.read_text(encoding="utf-8") if f.exists() else ""
+        with os.fdopen(fd, "w", encoding="utf-8") as out:
+            out.write(old)
+            out.write(line)
+        os.replace(tmp, f)
+    except Exception:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def load_history(chat_id: str, limit: int = 10) -> list:
+    """读最近 N 条 (尾部)"""
+    f = history_file(chat_id)
+    if not f.exists():
+        return []
+    lines = f.read_text(encoding="utf-8").splitlines()
+    return [json.loads(l) for l in lines[-limit:] if l.strip()]
+
+
+def clear_history(chat_id: str) -> int:
+    """清本 chat 历史, 返回删了几条"""
+    f = history_file(chat_id)
+    if not f.exists():
+        return 0
+    n = sum(1 for _ in f.read_text(encoding="utf-8").splitlines() if _.strip())
+    f.unlink()
+    return n
+
+
+# ==== 多 bot 路由 ====
+
+def load_routing() -> dict:
+    """读 chat_id → bot 映射"""
+    if not ROUTING_FILE.exists():
+        return {}
+    try:
+        return json.loads(ROUTING_FILE.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def save_routing(routing: dict) -> None:
+    """原子写"""
+    ROUTING_FILE.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=ROUTING_FILE.parent, prefix=".route_", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(routing, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, ROUTING_FILE)
+    except Exception:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def get_bot_for_chat(chat_id: str) -> str:
+    """查 chat 的 bot, 没设过返回 DEFAULT_CLI"""
+    routing = load_routing()
+    return routing.get(chat_id, DEFAULT_CLI)
+
+
+def set_bot_for_chat(chat_id: str, bot: str) -> None:
+    """设 chat 的 bot"""
+    if bot not in SUPPORTED_BOTS:
+        raise ValueError(f"未知 bot: {bot} (支持: {', '.join(SUPPORTED_BOTS)})")
+    routing = load_routing()
+    routing[chat_id] = bot
+    save_routing(routing)
+
+
+# ==== CLI 调用 ====
+
+def call_cli(prompt: str, cli: str) -> str:
+    if cli == "openclaw":
+        cmd = ["openclaw", "ask", prompt]
+    elif cli == "hermes":
+        cmd = ["hermes", "chat", "-q", prompt, "-Q"]
+    elif cli == "codex-pp":
+        cmd = ["codex-pp", "ask", prompt]
+    else:
+        return f"[错误] 未知 CLI: {cli}"
+    logger.info(f"执行 ({cli}): {' '.join(shlex.quote(c) for c in cmd)}")
+    try:
         result = subprocess.run(
             cmd,
-            capture_output=True,
-            text=True,
-            timeout=60,
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+            timeout=180
         )
         if result.returncode != 0:
             err = (result.stderr or result.stdout or "").strip()
-            logger.error(f"CLI 失败: {err}")
-            return f"[错误] CLI 返回 {result.returncode}: {err[:200]}"
+            return f"[错误] CLI {result.returncode}: {err[:200]}"
         out = (result.stdout or "").strip()
         return out if out else "[空响应]"
     except subprocess.TimeoutExpired:
-        return "[超时] CLI 60 秒没返回"
+        return "[超时] CLI 180 秒没回"
     except FileNotFoundError:
-        return f"[错误] 找不到 {cli} 命令(是否安装?PATH 里有吗?)"
+        return f"[错误] 找不到 {cli} 命令 (PATH 没装?)"
     except Exception as e:
-        logger.exception("CLI 调用异常")
+        logger.exception("CLI 异常")
         return f"[异常] {e}"
 
 
-# ============== 飞书消息处理 ==============
+# ==== 命令处理 ====
 
-def handle_message(sender: str, text: str) -> str:
-    """处理一条飞书消息,返回要回复的文本"""
+def cmd_help() -> str:
+    return (
+        "🤖 飞书网关 v0.2 (Hermes/OpenClaw)\n"
+        "命令:\n"
+        "  help / 帮助 - 列命令\n"
+        "  ping - 测试\n"
+        "  /bot <name> - 切 bot (hermes / openclaw / codex-pp)\n"
+        "  /bot - 查当前 bot\n"
+        "  /history [N] - 看最近 N 条历史 (默认 10)\n"
+        "  /reset - 清本 chat 历史\n"
+        "  任何问题 - 调当前 bot 回答"
+    )
+
+
+def cmd_history(chat_id: str, n: int = 10) -> str:
+    hist = load_history(chat_id, limit=n)
+    if not hist:
+        return "(本 chat 无历史)"
+    lines = [f"📜 最近 {len(hist)} 条 (chat {chat_id[:12]}...):"]
+    for h in hist:
+        ts = h.get("ts", "?")[:19]
+        sender = h.get("sender", "?")[:8]
+        text = (h.get("text") or h.get("response") or "")[:60]
+        bot = h.get("bot", "?")
+        lines.append(f"  [{ts}] {sender} via {bot}: {text}")
+    return "\n".join(lines)
+
+
+def handle_message(chat_id: str, sender_open_id: str, text: str) -> str:
     text = text.strip()
     if not text:
         return ""
 
     # 内置命令
     if text in ("help", "帮助", "?"):
-        return (
-            "🤖 可用命令:\n"
-            "  help - 显示本帮助\n"
-            "  ping - 测试连通性\n"
-            f"  cli <name> <问题> - 切换 CLI(openclaw/hermes/codex-pp)\n"
-            f"  当前 CLI: {DEFAULT_CLI}"
-        )
+        return cmd_help()
     if text in ("ping", "测试"):
-        return "pong ✓"
+        bot = get_bot_for_chat(chat_id)
+        return f"pong ✓ (bot={bot}, Hermes 网关 v0.2 ready)"
 
-    # 切换 CLI
-    parts = text.split(maxsplit=1)
-    if parts[0] == "cli" and len(parts) > 1:
-        global DEFAULT_CLI
-        sub = parts[1].split(maxsplit=1)
-        new_cli, rest = sub[0], sub[1] if len(sub) > 1 else ""
-        if new_cli in ("openclaw", "hermes", "codex-pp"):
-            DEFAULT_CLI = new_cli
-            return f"已切换到 {new_cli}"
-        else:
-            return f"未知 CLI: {new_cli}。可用: openclaw / hermes / codex-pp"
+    if text == "/bot":
+        return f"当前 bot: `{get_bot_for_chat(chat_id)}`"
 
-    # 默认:调 CLI 回答
-    logger.info(f"用户 [{sender}] 问: {text[:80]}")
-    response = call_cli(text)
-    logger.info(f"CLI 回复长度: {len(response)}")
+    if text.startswith("/bot "):
+        new_bot = text[5:].strip()
+        if new_bot not in SUPPORTED_BOTS:
+            return f"未知 bot: {new_bot}\n支持: {', '.join(SUPPORTED_BOTS)}"
+        set_bot_for_chat(chat_id, new_bot)
+        return f"✓ 本 chat 切到 `{new_bot}` (持久化)"
+
+    if text == "/reset":
+        n = clear_history(chat_id)
+        return f"✓ 清掉 {n} 条历史"
+
+    if text.startswith("/history"):
+        parts = text.split()
+        n = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 10
+        return cmd_history(chat_id, n)
+
+    # 调 bot
+    bot = get_bot_for_chat(chat_id)
+    logger.info(f"[{chat_id[:12]}/{sender_open_id[:8]}] ({bot}) 问: {text[:80]}")
+    response = call_cli(text, bot)
+    logger.info(f"[{chat_id[:12]}] 回: {response[:80]}")
+
+    # 持久化
+    save_message(chat_id, {
+        "chat_id": chat_id,
+        "sender": sender_open_id,
+        "text": text,
+        "bot": bot,
+        "response": response[:500],  # 截断避免巨大
+    })
+
     return response
 
 
-# ============== 飞书 webhook 处理 ==============
+# ==== 飞书发消息 ====
 
-def process_event(event_data: dict) -> dict:
-    """处理一条飞书事件,返回响应"""
+_http_client = None
+
+
+def reply_text(message, text: str):
+    """发文本消息回飞书"""
+    global _http_client
+    if _http_client is None:
+        return
+    if not HAS_LARK:
+        return
     try:
-        header = event_data.get("header", {})
-        event_type = header.get("event_type", "")
+        req = (
+            lark.im.v1.CreateMessageRequest.builder()
+            .receive_id_type("open_id")
+            .request_body(
+                lark.im.v1.CreateMessageRequestBody.builder()
+                .receive_id(message.sender.sender_id.open_id)
+                .msg_type("text")
+                .content(json.dumps({"text": text[:3000]}))
+                .build()
+            )
+            .build()
+        )
+        resp = _http_client.im.v1.message.create(req)
+        if not resp.success():
+            logger.error(f"发消息失败: {resp.code} {resp.msg}")
+    except Exception as e:
+        logger.exception(f"回消息异常: {e}")
 
-        if event_type != "im.message.receive_v1":
-            logger.debug(f"忽略事件类型: {event_type}")
-            return {"code": 0}
 
-        event = event_data.get("event", {})
-        sender = event.get("sender", {}).get("sender_id", {}).get("open_id", "unknown")
-        message = event.get("message", {})
-        msg_type = message.get("message_type", "text")
-        text = message.get("content", "{}")
+def get_chat_id(message) -> str:
+    """取 chat_id (优先 chat_id, fallback open_id)"""
+    try:
+        return message.message.chat_id
+    except AttributeError:
+        try:
+            return message.sender.sender_id.open_id
+        except AttributeError:
+            return "unknown"
 
-        # 只处理 text 类型
-        if msg_type != "text":
-            reply = f"[暂不支持 {msg_type} 类型消息]"
-        else:
-            try:
-                text_data = json.loads(text)
-                text = text_data.get("text", "").strip()
-            except Exception:
-                text = text.strip()
 
-        # 去掉 @机器人 前缀
+# ==== WebSocket 事件回调 ====
+
+def on_message_receive(event):
+    if not HAS_LARK:
+        return
+    try:
+        msg = event.event
+        if msg.message.message_type != "text":
+            return
+        try:
+            content = json.loads(msg.message.content)
+            text = content.get("text", "").strip()
+        except Exception:
+            text = msg.message.content.strip()
+        # 去 @ bot
         if text.startswith("@"):
             parts = text.split(maxsplit=1)
             text = parts[1] if len(parts) > 1 else ""
-
-        reply = handle_message(sender, text)
-        logger.info(f"回复 [{sender}]: {reply[:80] if reply else '(空)'}")
-
-        return {
-            "code": 0,
-            "msg": "ok",
-            "data": {"reply": reply},
-        }
+        chat_id = get_chat_id(msg)
+        sender = msg.sender.sender_id.open_id if hasattr(msg.sender, 'sender_id') else "?"
+        reply = handle_message(chat_id, sender, text)
+        if reply:
+            reply_text(msg, reply)
     except Exception as e:
-        logger.exception("处理事件失败")
-        return {"code": 1, "msg": str(e)}
+        logger.exception("处理消息失败")
 
 
-# ============== HTTP 服务(webhook 模式) ==============
+# ==== 启动 ====
 
-def run_webhook_server():
-    """用内置 http.server 跑 webhook"""
-    from http.server import BaseHTTPRequestHandler, HTTPServer
+def main():
+    global _http_client
+    if not APP_ID or not APP_SECRET:
+        logger.error("FEISHU_APP_ID / FEISHU_APP_SECRET 未设置,看 .env")
+        sys.exit(1)
+    if not HAS_LARK:
+        logger.error("缺 lark_oapi, 跑: pip install lark-oapi")
+        sys.exit(1)
 
-    class Handler(BaseHTTPRequestHandler):
-        def do_POST(self):
-            length = int(self.headers.get("Content-Length", 0))
-            body = self.rfile.read(length)
-            try:
-                event = json.loads(body.decode("utf-8"))
-                # 验证 token(可选)
-                token = event.get("token", "")
-                if VERIFICATION_TOKEN and token != VERIFICATION_TOKEN:
-                    self.send_response(401)
-                    self.end_headers()
-                    return
-                # URL 验证挑战
-                if event.get("type") == "url_verification":
-                    self.send_response(200)
-                    self.send_header("Content-Type", "application/json")
-                    self.end_headers()
-                    self.wfile.write(json.dumps({"challenge": event.get("challenge", "")}).encode())
-                    return
-                # 处理消息
-                response = process_event(event)
-                self.send_response(200)
-                self.send_header("Content-Type", "application/json")
-                self.end_headers()
-                self.wfile.write(json.dumps(response).encode())
-            except Exception as e:
-                logger.exception("Webhook 处理失败")
-                self.send_response(500)
-                self.end_headers()
+    _http_client = lark.Client.builder().app_id(APP_ID).app_secret(APP_SECRET).build()
 
-        def log_message(self, format, *args):
-            pass  # 禁用默认日志
+    handler = (
+        lark.EventDispatcherHandler.builder("", "")
+        .register_p2_im_message_receive_v1(on_message_receive)
+        .build()
+    )
 
-    server = HTTPServer(("0.0.0.0", LISTEN_PORT), Handler)
-    logger.info(f"飞书 webhook 服务启动: 0.0.0.0:{LISTEN_PORT}")
+    ws_client = lark.ws.Client(
+        APP_ID, APP_SECRET,
+        event_handler=handler,
+        log_level=lark.LogLevel.INFO,
+    )
+
+    logger.info("=" * 50)
+    logger.info("飞书网关 v0.2 (WebSocket 模式)")
     logger.info(f"App ID: {APP_ID}")
     logger.info(f"默认 CLI: {DEFAULT_CLI}")
-    try:
-        server.serve_forever()
-    except KeyboardInterrupt:
-        logger.info("服务停止")
+    logger.info(f"history: {HISTORY_DIR}")
+    logger.info(f"routing: {ROUTING_FILE}")
+    logger.info("=" * 50)
+    logger.info("启动长连接,等飞书推事件...")
+    ws_client.start()
 
-
-# ============== CLI 调试模式 ==============
-
-def cli_debug_mode():
-    """直接测试 CLI 调用(不启动服务)"""
-    print("飞书机器人 CLI 调试模式")
-    print(f"默认 CLI: {DEFAULT_CLI}")
-    print("输入 'help' 看命令, 'quit' 退出")
-    print()
-    while True:
-        try:
-            user_input = input("飞书消息> ").strip()
-        except (EOFError, KeyboardInterrupt):
-            break
-        if not user_input:
-            continue
-        if user_input.lower() in ("quit", "exit", "q"):
-            break
-        reply = handle_message("debug-user", user_input)
-        print(f"  回复: {reply}\n")
-
-
-# ============== 入口 ==============
 
 if __name__ == "__main__":
-    import argparse
-    parser = argparse.ArgumentParser(description="飞书机器人(本地 CLI 网关)")
-    parser.add_argument("--debug", action="store_true", help="调试模式(不启动服务)")
-    parser.add_argument("--check", action="store_true", help="检查 CLI 是否可用")
-    args = parser.parse_args()
-
-    if args.check:
-        print("检查 CLI 可用性...")
-        for cli in ["openclaw", "hermes", "codex-pp"]:
-            try:
-                result = subprocess.run(
-                    [cli, "--version"],
-                    capture_output=True,
-                    text=True,
-                    timeout=5,
-                )
-                if result.returncode == 0:
-                    ver = (result.stdout or result.stderr).strip().split("\n")[0]
-                    print(f"  ✓ {cli}: {ver}")
-                else:
-                    print(f"  ✗ {cli}: 返回 {result.returncode}")
-            except FileNotFoundError:
-                print(f"  ✗ {cli}: 找不到(没安装?PATH 没?)")
-            except Exception as e:
-                print(f"  ✗ {cli}: {e}")
-        sys.exit(0)
-
-    if args.debug:
-        cli_debug_mode()
-    else:
-        run_webhook_server()
+    main()
