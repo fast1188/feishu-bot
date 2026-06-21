@@ -130,3 +130,42 @@ MIT
 ![微信群](assets/wechat-qr.png)
 
 或提 [GitHub Issue](https://github.com/fast118/feishu-bot/issues)
+
+
+## v0.2 更新 (2026-06-21)
+
+- ✨ **消息持久化**: 每条消息写到 `~/.feishu_bot/history/<chat_id>.jsonl` (原子写)
+- ✨ **多 bot 路由**: 每个 chat 记住默认 bot (hermes / openclaw / codex-pp), 存到 `~/.feishu_bot/routing.json`
+- ✨ **新命令**:
+  - `/bot <name>` - 切 bot (本 chat 持久化)
+  - `/bot` - 查当前 bot
+  - `/history [N]` - 看最近 N 条历史 (默认 10)
+  - `/reset` - 清本 chat 历史
+- ✨ **fcntl 文件锁** (Unix), Windows 退化单进程假设
+- ✨ **原子写** (tempfile + os.replace)
+- ✅ 14 个 unittest 全过 (test_history / test_routing / test_handle_message)
+
+## v0.2 命令示例
+
+```
+你: /bot openclaw
+bot: ✓ 本 chat 切到 openclaw (持久化)
+
+你: /history 3
+bot: 📜 最近 3 条 (chat xxx...):
+  [2026-06-21 10:30] user via openclaw: ...
+
+你: API 调用失败怎么查?
+bot: (openclaw 答) ...
+```
+
+## v0.2 vs v0.1
+
+| 项 | v0.1 (06-15) | v0.2 (06-21) |
+|---|------|------|
+| 消息持久化 | ❌ | ✅ jsonl 按 chat |
+| 多 bot 路由 | ❌ 全局单一 CLI | ✅ 每 chat 独立 |
+| /history 命令 | ❌ | ✅ 最近 N 条 |
+| /reset 命令 | ❌ | ✅ |
+| /bot 命令 | cli x 命令 (临时) | /bot x (持久化) |
+| unittest | 0 | 14 (3 类) |
