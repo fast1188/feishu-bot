@@ -221,13 +221,38 @@ def call_cli(prompt: str, cli: str) -> str:
         result = subprocess.run(
             cmd,
             capture_output=True, text=True, encoding="utf-8", errors="replace",
-            timeout=180
+            timeout=180,
         )
-        if result.returncode != 0:
-            err = (result.stderr or result.stdout or "").strip()
-            return f"[错误] CLI {result.returncode}: {err[:200]}"
+        if result.returncode == 0:
+            out = (result.stdout or "").strip()
+            return out if out else "[空响应]"
+        # 错误: 优先显示 stdout (hermes 把 API 错误打到 stdout), 再 stderr, 最后 exit code
         out = (result.stdout or "").strip()
-        return out if out else "[空响应]"
+        err = (result.stderr or "").strip()
+        msg = out or err or f"(no output, exit={result.returncode})"
+
+        # 翻译常见 Windows 错误码
+        rc = result.returncode
+        win_hints = {
+            3221225786: "Windows: 进程被强制终止 (可能是 DLL 初始化失败 / 内存访问违例)",
+            3221225477: "Windows: ACCESS_VIOLATION (内存访问违例)",
+            3221225501: "Windows: 栈溢出",
+            3221225595: "Windows: 堆损坏",
+            1: "通用错误 (hermes 通常把真原因打到 stdout)",
+        }
+        hint = win_hints.get(rc, "")
+
+        # 检测 API 错误类型 (token 耗尽 / 401 / 超时)
+        api_hint = ""
+        lo = msg.lower()
+        if "429" in msg or "token plan" in lo or "用量上限" in msg:
+            api_hint = " → 【MiniMax Token Plan 额度耗尽】等下月重置, 或换账号, 或换 deepseek(已 dead)"
+        elif "401" in msg or "unauthorized" in lo or "authorized_error" in lo:
+            api_hint = " → 【API Key 失效】去 minimax 后台重置"
+        elif "timeout" in lo:
+            api_hint = " → 【超时】网络问题或 provider 慢"
+
+        return f"[错误] CLI 退出码 {rc}{(' · ' + hint) if hint else ''}: {msg[:300]}{api_hint}"
     except subprocess.TimeoutExpired:
         return "[超时] CLI 180 秒没回"
     except FileNotFoundError:

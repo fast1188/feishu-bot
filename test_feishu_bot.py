@@ -143,6 +143,42 @@ class TestHandleMessage(unittest.TestCase):
                 self.assertEqual(hist[0]["response"], "mocked answer")
                 self.assertEqual(hist[0]["bot"], "hermes")
 
+    def test_error_429_shows_token_plan_hint(self):
+        """429 / Token Plan 错误必须显示真正原因, 不只是 exit code"""
+        with patch.object(fb, "DEFAULT_CLI", "hermes"):
+            with patch("subprocess.run") as mock_run:
+                mock_run.return_value.returncode = 1
+                mock_run.return_value.stdout = "API call failed after 3 retries: HTTP 429: 已达到 Token Plan 用量上限 (2056)"
+                mock_run.return_value.stderr = ""
+                r = fb.handle_message("c", "s", "什么是 API?")  # 非 ping/help, 走 call_cli
+                self.assertIn("Token Plan", r)
+                self.assertIn("用量上限", r)
+                self.assertIn("额度耗尽", r)  # 中文 hint
+                # 不能只显示 exit code
+                self.assertNotIn("[错误] CLI 1: ", r[:20])
+
+    def test_error_401_shows_key_hint(self):
+        """401 / 失效 key 必须显示具体原因"""
+        with patch.object(fb, "DEFAULT_CLI", "hermes"):
+            with patch("subprocess.run") as mock_run:
+                mock_run.return_value.returncode = 1
+                mock_run.return_value.stdout = "AuthenticationError: 401 unauthorized"
+                mock_run.return_value.stderr = ""
+                r = fb.handle_message("c", "s", "测试中文")
+                self.assertIn("API Key 失效", r)
+                self.assertIn("401", r)
+
+    def test_windows_error_code_translated(self):
+        """Windows 错误码 (如 3221225786) 应翻译成人话"""
+        with patch.object(fb, "DEFAULT_CLI", "hermes"):
+            with patch("subprocess.run") as mock_run:
+                mock_run.return_value.returncode = 3221225786  # 0xC000013A
+                mock_run.return_value.stdout = ""
+                mock_run.return_value.stderr = ""
+                r = fb.handle_message("c", "s", "测试问题")
+                self.assertIn("3221225786", r)
+                self.assertIn("Windows", r)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
