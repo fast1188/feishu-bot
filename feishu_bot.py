@@ -1,4 +1,4 @@
-"""
+﻿"""
 feishu_bot.py - Hermes/OpenClaw 飞书网关 v0.2 (WebSocket 长连接模式)
 =========================================================================
 
@@ -30,6 +30,8 @@ import subprocess
 import shlex
 import logging
 import tempfile
+import urllib.request
+import urllib.error
 from datetime import datetime
 from pathlib import Path
 
@@ -80,7 +82,7 @@ logger = logging.getLogger("hermes-feishu")
 
 APP_ID = os.getenv("FEISHU_APP_ID", "")
 APP_SECRET = os.getenv("FEISHU_APP_SECRET", "")
-DEFAULT_CLI = os.getenv("FEISHU_CLI", "hermes")
+DEFAULT_CLI = os.getenv("FEISHU_CLI", "openclaw")
 SUPPORTED_BOTS = ("hermes", "openclaw", "codex-pp")
 
 # ==== 持久化路径 ====
@@ -209,9 +211,11 @@ def set_bot_for_chat(chat_id: str, bot: str) -> None:
 
 def call_cli(prompt: str, cli: str) -> str:
     if cli == "openclaw":
-        cmd = ["openclaw", "ask", prompt]
+        # cmd /c + --json 让 Windows 找到 openclaw.cmd 并输出 JSON 避免 warnings 污染
+        cmd = ["cmd", "/c", "openclaw", "agent", "--agent", "main", "--message", prompt, "--json"]
     elif cli == "hermes":
-        cmd = ["hermes", "chat", "-q", prompt, "-Q"]
+        # 绕过 hermes cli 慢启动 (24s) - 直接调 OpenAI 兼容 API (MiniMax)
+        return _call_minimax_api(prompt)
     elif cli == "codex-pp":
         cmd = ["codex-pp", "ask", prompt]
     else:
@@ -221,10 +225,32 @@ def call_cli(prompt: str, cli: str) -> str:
         result = subprocess.run(
             cmd,
             capture_output=True, text=True, encoding="utf-8", errors="replace",
-            timeout=180,
+            timeout=180, creationflags=0x08000000,
         )
         if result.returncode == 0:
             out = (result.stdout or "").strip()
+            # openclaw --json 时从 JSON 提取实际文本内容
+            # 兼容多种结构: payloads[0].text / result.payloads[0].text / 顶层 text
+            if out.startswith("{"):
+                try:
+                    j = json.loads(out)
+                    text = None
+                    # 路径 1: payloads[0].text (openclaw 当前结构)
+                    payloads = j.get("payloads") or []
+                    if payloads and payloads[0].get("text"):
+                        text = payloads[0]["text"]
+                    # 路径 2: result.payloads[0].text (旧结构)
+                    if not text:
+                        payloads = j.get("result", {}).get("payloads") or []
+                        if payloads and payloads[0].get("text"):
+                            text = payloads[0]["text"]
+                    # 路径 3: 顶层 text / response / output
+                    if not text:
+                        text = j.get("text") or j.get("response") or j.get("output")
+                    if text:
+                        return text.strip() if isinstance(text, str) else str(text)
+                except Exception:
+                    pass
             return out if out else "[空响应]"
         # 错误: 优先显示 stdout (hermes 把 API 错误打到 stdout), 再 stderr, 最后 exit code
         out = (result.stdout or "").strip()
@@ -260,6 +286,39 @@ def call_cli(prompt: str, cli: str) -> str:
     except Exception as e:
         logger.exception("CLI 异常")
         return f"[异常] {e}"
+
+
+def _call_minimax_api(prompt: str, timeout: int = 30) -> str:
+    """直接调 MiniMax (OpenAI 兼容) API - 绕过 hermes cli 慢启动 (24s)"""
+    api_key = os.environ.get("OPENAI_API_KEY") or os.environ.get("MINIMAX_CN_API_KEY", "")
+    api_base = os.environ.get("OPENAI_BASE_URL") or os.environ.get("MINIMAX_CN_BASE_URL", "https://api.minimaxi.com/v1")
+    model = "MiniMax-M3"
+    if not api_key:
+        return "[错误] 缺 API key (设 OPENAI_API_KEY 或 MINIMAX_CN_API_KEY)"
+    body = json.dumps({
+        "model": model,
+        "messages": [
+            {"role": "system", "content": "你是 Hermes Agent, AI 助手。用中文回复, 简洁直接。"},
+            {"role": "user", "content": prompt}
+        ],
+        "stream": False,
+    }).encode("utf-8")
+    req = urllib.request.Request(
+        f"{api_base.rstrip('/')}/chat/completions",
+        data=body,
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+            return data["choices"][0]["message"]["content"].strip()
+    except urllib.error.HTTPError as e:
+        return f"[错误] API HTTP {e.code}: {e.read().decode('utf-8', errors='ignore')[:200]}"
+    except Exception as e:
+        return f"[错误] API 调用失败: {e}"
 
 
 # ==== 命令处理 ====
@@ -444,7 +503,12 @@ def main():
     logger.info(f"routing: {ROUTING_FILE}")
     logger.info("=" * 50)
     logger.info("启动长连接,等飞书推事件...")
-    ws_client.start()
+    while True:
+        try:
+            ws_client.start()
+        except Exception as e:
+            logger.warning(f"连接断开 ({e}), 30 秒后重连...")
+            time.sleep(30)
 
 
 if __name__ == "__main__":

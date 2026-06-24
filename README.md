@@ -113,9 +113,9 @@ cli codex-pp 你的问题  # 用 codex-pp 回(默认)
 
 ## 相关项目
 
-- [codex-pp](https://github.com/fast118/codex-pp) - 国产化 AI CLI
-- [cc-switch](https://github.com/fast118/cc-switch) - 桌面 GUI
-- [ai-agent-skills](https://github.com/fast118/ai-agent-skills) - 11 个 skills
+- [codex-pp](https://github.com/fast1188/codex-pp) - 国产化 AI CLI
+- [cc-switch](https://github.com/fast1188/cc-switch) - 桌面 GUI
+- [ai-agent-skills](https://github.com/fast1188/ai-agent-skills) - 11 个 skills
 - 飞书开放平台: https://open.feishu.cn/app
 
 ## 许可证
@@ -129,7 +129,7 @@ MIT
 
 ![微信群](assets/wechat-qr.png)
 
-或提 [GitHub Issue](https://github.com/fast118/feishu-bot/issues)
+或提 [GitHub Issue](https://github.com/fast1188/feishu-bot/issues)
 
 
 ## v0.2 更新 (2026-06-21)
